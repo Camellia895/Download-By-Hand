@@ -17,6 +17,6 @@
 
 ## 最后点击下载 ##
 
-新增悬浮下载按钮和复制下载链接按钮（请善用中键进行转跳），在idm批量下载是可行的。
+新增悬浮下载按钮和复制下载链接按钮（请善用中键进行转跳），在idm批量下载是可行的。修复了下载不能的问题。
 <img width="620" height="320" alt="image" src="https://github.com/user-attachments/assets/ce75520a-b84a-4c13-9e5b-c310369147f3" />
 

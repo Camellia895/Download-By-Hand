@@ -1,13 +1,11 @@
 // ==UserScript==
 // @name         X 媒体批量下载器
 // @namespace    https://github.com/Camellia895
-// @version      1.0
-// @description  在推文中添加“下载”按钮，下载PNG原图。在用户的'媒体'页面，增加“批量下载”按钮，可滚动收集页面所有图片后一键下载。修复了批量下载时的性能问题。
+// @version      2.9
+// @description  采用事件驱动的悬浮下载按钮，解决了图标出现迟缓的问题，带来极致流畅的单图下载体验。
 // @author       Gemini & Camellia895
 // @match        *://*.twitter.com/*
 // @match        *://*.x.com/*
-// @grant        GM_registerMenuCommand
-// @grant        GM_unregisterMenuCommand
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @license      MIT
@@ -20,242 +18,274 @@
     'use strict';
 
     // --- 全局状态和设置 ---
-    const STYLE = { DATE_ONLY: 1, DATE_HMS: 2 };
-    let namingStyle = GM_getValue('namingStyle', STYLE.DATE_ONLY);
-    let menuIDs = [];
+    const BATCH_SIZE = 30;
+    const DOWNLOAD_SVG_ICON = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="white" width="60%" height="60%"><path d="M12 15.5l-5-5h3V2h4v8.5h3l-5 5zM5 20h14v-2H5v2z"></path></svg>`;
 
-    // 批量下载器的状态
+    // 媒体页批量下载器状态
     let isCollecting = false;
     let downloadQueue = new Set();
     let mediaPageObserver = null;
     let batchDownloadBtn = null;
-    let currentUsername = '';
-    let lastReportedCount = 0; // 【修复】用于条件性更新
+    let copyLinksBtn = null;
+    let activeButton = null;
 
-    // --- 菜单和命名规则 ---
-    function registerMenu() {
-        menuIDs.forEach(id => { try { GM_unregisterMenuCommand(id); } catch (e) {} });
-        menuIDs = [];
-        const label1 = (namingStyle === STYLE.DATE_ONLY ? '✅ ' : '❌ ') + '命名：年月日 (单推文)';
-        menuIDs.push(GM_registerMenuCommand(label1, () => {
-            namingStyle = STYLE.DATE_ONLY;
-            GM_setValue('namingStyle', namingStyle);
-            registerMenu();
-        }));
-        const label2 = (namingStyle === STYLE.DATE_HMS ? '✅ ' : '❌ ') + '命名：年月日-时分秒 (单推文)';
-        menuIDs.push(GM_registerMenuCommand(label2, () => {
-            namingStyle = STYLE.DATE_HMS;
-            GM_setValue('namingStyle', namingStyle);
-            registerMenu();
-        }));
-    }
-    registerMenu();
-
-    function formatDate(d) {
-        const Y = d.getFullYear(), M = String(d.getMonth() + 1).padStart(2, '0'), D = String(d.getDate()).padStart(2, '0');
-        let s = `${Y}${M}${D}`;
-        if (namingStyle === STYLE.DATE_HMS) {
-            const h = String(d.getHours()).padStart(2, '0'), m = String(d.getMinutes()).padStart(2, '0'), sec = String(d.getSeconds()).padStart(2, '0');
-            s += `-${h}${m}${sec}`;
-        }
-        return s;
-    }
-
-    // 【修复】节流工具函数
+    // --- 工具函数: 节流 ---
     function throttle(func, limit) {
         let inThrottle;
         return function() {
-            const args = arguments;
-            const context = this;
-            if (!inThrottle) {
-                func.apply(context, args);
-                inThrottle = true;
-                setTimeout(() => inThrottle = false, limit);
-            }
+            if (!inThrottle) { func.apply(this, arguments); inThrottle = true; setTimeout(() => inThrottle = false, limit); }
         };
     }
 
-    // --- 核心下载函数 ---
+    // --- 核心下载与URL处理 ---
     async function download(url, filename) {
         try {
-            const res = await fetch(url);
-            if (!res.ok) { console.error(`下载失败: ${res.status}`, url); return; }
-            const blob = await res.blob();
+            const response = await fetch(url);
+            if (!response.ok) {
+                console.error(`下载失败: ${response.status}`, url);
+                const fallbackUrl = url.replace('format=png', 'format=jpg');
+                const fallbackResponse = await fetch(fallbackUrl);
+                if (!fallbackResponse.ok) return;
+                const blob = await fallbackResponse.blob();
+                const blobUrl = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = blobUrl; a.download = filename.replace('.png', '.jpg');
+                document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(blobUrl);
+                return;
+            }
+            const blob = await response.blob();
             const blobUrl = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = blobUrl; a.download = filename;
-            document.body.appendChild(a); a.click(); a.remove();
-            URL.revokeObjectURL(blobUrl);
+            document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(blobUrl);
         } catch (error) { console.error('下载时发生网络错误:', error); }
     }
 
-    // --- 功能1: 单条推文下载 ---
+    function getOriginalUrl(thumbnailUrl) {
+        const baseUrl = thumbnailUrl.split('?')[0];
+        return `${baseUrl}?format=png&name=4096x4096`;
+    }
+
+    function getImageIdFromUrl(url) {
+        return url.split('/').pop().split('?')[0];
+    }
+
+    // ===================================================================
+    // 功能1: 单条推文下载
+    // ===================================================================
     function addSingleTweetButton(tweet) {
-        if (tweet.querySelector('.download-images-btn')) return;
-        const grp = tweet.querySelector('div[role="group"]');
+        const grp = tweet.querySelector('div[role="group"]:not(:has(.download-images-btn))');
         if (!grp) return;
         const btn = document.createElement('button');
         btn.innerText = '下载图片';
         btn.className = 'download-images-btn';
-        btn.style.cssText = 'margin-left:8px;cursor:pointer;background:#1da1f2;color:#fff;border:none;padding:4px 8px;border-radius:4px;font-size:12px;';
+        btn.style.cssText = 'margin-left:8px;cursor:pointer;background:#1da1f2;color:#fff;border:none;padding:4px 8px;border-radius:99px;font-size:12px;';
         btn.addEventListener('click', async (e) => {
             e.preventDefault(); e.stopPropagation();
-            let name = 'unknown';
-            const userElement = tweet.querySelector('[data-testid="User-Name"]');
-            if (userElement) {
-                const nameDiv = userElement.querySelector('div[dir="ltr"]');
-                if (nameDiv && nameDiv.textContent.trim()) name = nameDiv.textContent.trim();
-            }
-            name = name.replace(/[\\/:*?"<>|]/g, '_');
-            const timeEl = tweet.querySelector('time');
-            const dt = timeEl ? new Date(timeEl.dateTime) : new Date();
-            const ds = formatDate(dt);
-            const imgs = tweet.querySelectorAll('img[src*="pbs.twimg.com/media"]');
-            const urls = Array.from(imgs, img => img.src.split('?')[0] + '?name=orig&format=png');
-            if (!urls.length) return;
-            const single = urls.length === 1;
-            for (let i = 0; i < urls.length; i++) {
-                const fn = single ? `${name}-${ds}.png` : `${name}-${ds}-${String(i + 1).padStart(2, '0')}.png`;
-                await download(urls[i], fn);
-                if (!single) await new Promise(resolve => setTimeout(resolve, 500));
+            const currentTweet = e.target.closest('article[role="article"]');
+            if (!currentTweet) return;
+            const imgs = currentTweet.querySelectorAll('img[src*="pbs.twimg.com/media"]');
+            const urls = Array.from(imgs, img => getOriginalUrl(img.src));
+            if (!urls.length) { alert('在这条推文中没有找到可下载的图片。'); return; }
+            for (const url of urls) {
+                const fn = `${getImageIdFromUrl(url)}.png`;
+                await download(url, fn);
+                if (urls.length > 1) await new Promise(resolve => setTimeout(resolve, 500));
             }
         });
         grp.appendChild(btn);
     }
+    
+    // ===================================================================
+    // 【全新实现】功能2: 媒体页悬浮下载 (事件驱动)
+    // ===================================================================
+    function addHoverDownloader(imageLink) {
+        if (imageLink.dataset.hoverListenerAdded) return;
+        imageLink.style.position = 'relative';
 
-    // --- 功能2: 媒体页批量下载 ---
-    function getUsernameFromURL() {
-        const match = window.location.pathname.match(/^\/([a-zA-Z0-9_]+)/);
-        return match ? match[1] : 'unknown_user';
+        imageLink.addEventListener('mouseenter', () => {
+            if (imageLink.querySelector('.hover-download-overlay')) return;
+
+            const overlay = document.createElement('div');
+            overlay.className = 'hover-download-overlay';
+            overlay.style.cssText = `
+                position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+                background-color: rgba(0, 0, 0, 0.4);
+                display: flex; align-items: center; justify-content: center;
+                cursor: pointer;
+            `;
+
+            const iconContainer = document.createElement('div');
+            iconContainer.style.cssText = `
+                width: 50%; height: 50%; max-width: 70px; max-height: 70px;
+                background-color: rgba(0, 0, 0, 0.6);
+                border-radius: 50%; display: flex; align-items: center; justify-content: center;
+                border: 2px solid white;
+            `;
+            iconContainer.innerHTML = DOWNLOAD_SVG_ICON;
+            overlay.appendChild(iconContainer);
+
+            overlay.onclick = async (e) => {
+                e.preventDefault(); e.stopPropagation();
+                
+                const img = imageLink.querySelector('img[src*="pbs.twimg.com/media"]');
+                if (!img) return;
+
+                iconContainer.innerHTML = '...';
+                const originalUrl = getOriginalUrl(img.src);
+                const filename = `${getImageIdFromUrl(originalUrl)}.png`;
+                await download(originalUrl, filename);
+                overlay.remove(); // 下载后移除
+            };
+            
+            imageLink.appendChild(overlay);
+        });
+
+        imageLink.addEventListener('mouseleave', () => {
+            const overlay = imageLink.querySelector('.hover-download-overlay');
+            if (overlay) overlay.remove();
+        });
+
+        imageLink.dataset.hoverListenerAdded = 'true';
     }
 
-    // 【修复】扫描函数现在只负责收集数据，不直接更新UI
+
+    // ===================================================================
+    // 功能3: 媒体页批量操作
+    // ===================================================================
+    function updateActiveButtonText() {
+        if (isCollecting && activeButton) {
+            activeButton.textContent = `收集中(${downloadQueue.size})... 再点一次执行`;
+        }
+    }
+
     function scanForMediaImages() {
         const images = document.querySelectorAll('a[href*="/photo/"] img[src*="pbs.twimg.com/media"]');
-        let initialSize = downloadQueue.size;
+        const initialSize = downloadQueue.size;
         images.forEach(img => downloadQueue.add(img.src));
-
-        // 【修复】只有当数量实际增加时，才去更新按钮文本
-        if (downloadQueue.size > lastReportedCount) {
-            console.log(`发现 ${downloadQueue.size - lastReportedCount} 张新图片, 总计 ${downloadQueue.size} 张.`);
-            lastReportedCount = downloadQueue.size;
-            if (batchDownloadBtn && isCollecting) {
-                batchDownloadBtn.textContent = `收集中... (${lastReportedCount} 张). 再点一次开始下载`;
-            }
+        if (downloadQueue.size > initialSize) updateActiveButtonText();
+    }
+    const throttledScan = throttle(scanForMediaImages, 500);
+    
+    function resetButtons() {
+        activeButton = null;
+        if(batchDownloadBtn) {
+            batchDownloadBtn.textContent = '批量下载';
+            batchDownloadBtn.style.backgroundColor = '#1da1f2';
+            batchDownloadBtn.style.opacity = '1';
+            batchDownloadBtn.disabled = false;
+        }
+        if(copyLinksBtn) {
+            copyLinksBtn.textContent = '复制链接';
+            copyLinksBtn.style.backgroundColor = '#28a745';
+            copyLinksBtn.style.opacity = '1';
+            copyLinksBtn.disabled = false;
         }
     }
-    // 【修复】创建一个节流版的扫描函数，每500毫秒最多执行一次
-    const throttledScan = throttle(scanForMediaImages, 500);
 
-    function startCollecting() {
-        console.log("开始收集图片...");
+    function startCollecting(triggerButton) {
         isCollecting = true;
+        activeButton = triggerButton;
         downloadQueue.clear();
-        lastReportedCount = 0;
-        currentUsername = getUsernameFromURL();
-
-        if (batchDownloadBtn) {
-            batchDownloadBtn.textContent = '收集中... (0 张). 再点一次开始下载';
-            batchDownloadBtn.style.backgroundColor = '#ff69b4';
+        if (triggerButton === batchDownloadBtn && copyLinksBtn) {
+            copyLinksBtn.disabled = true; copyLinksBtn.style.opacity = '0.5';
         }
-
-        throttledScan(); // 立即执行一次
-
-        // 【修复】观察目标更精确，不再是整个body，而是主要内容区域
+        if (triggerButton === copyLinksBtn && batchDownloadBtn) {
+            batchDownloadBtn.disabled = true; batchDownloadBtn.style.opacity = '0.5';
+        }
+        triggerButton.style.backgroundColor = '#ff69b4';
+        updateActiveButtonText();
+        throttledScan();
         const targetNode = document.querySelector('main[role="main"]');
-        if (!targetNode) {
-            console.error("找不到主要内容区域 (main[role='main']) 来进行观察。");
-            return;
-        }
+        if (!targetNode) { console.error("找不到主要内容区域。"); return; }
         mediaPageObserver = new MutationObserver(throttledScan);
         mediaPageObserver.observe(targetNode, { childList: true, subtree: true });
     }
 
     async function stopCollectingAndDownload() {
-        console.log("收集完成, 准备下载...");
         isCollecting = false;
-        if (mediaPageObserver) {
-            mediaPageObserver.disconnect();
-            mediaPageObserver = null;
-        }
-
-        if (downloadQueue.size === 0) {
-            alert("没有收集到任何图片链接！");
-            if (batchDownloadBtn) {
-                 batchDownloadBtn.textContent = '批量下载媒体';
-                 batchDownloadBtn.style.backgroundColor = '#1da1f2';
-            }
-            return;
-        }
-
+        if (mediaPageObserver) mediaPageObserver.disconnect();
         const urlsToDownload = Array.from(downloadQueue);
+        if (urlsToDownload.length === 0) { alert("无图片链接！"); resetButtons(); return; }
         for (let i = 0; i < urlsToDownload.length; i++) {
+            if (i > 0 && i % BATCH_SIZE === 0) {
+                if (!confirm(`已下载 ${i}/${urlsToDownload.length}。继续?`)) {
+                    alert(`下载已暂停。`); resetButtons(); return;
+                }
+            }
             const url = urlsToDownload[i];
-            const baseUrl = url.split('?')[0];
-            const imageId = baseUrl.split('/').pop();
-            const originalUrl = `${baseUrl}?format=png&name=orig`;
-            const filename = `${currentUsername}-${imageId}.png`;
-
+            const originalUrl = getOriginalUrl(url);
+            const filename = `${getImageIdFromUrl(url)}.png`;
             if (batchDownloadBtn) {
-                batchDownloadBtn.textContent = `下载中: ${i + 1} / ${urlsToDownload.length}`;
+                batchDownloadBtn.textContent = `下载中: ${i + 1}/${urlsToDownload.length}`;
                 batchDownloadBtn.style.backgroundColor = '#f44336';
             }
-
             await download(originalUrl, filename);
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            await new Promise(resolve => setTimeout(resolve, 1500));
         }
-
-        alert(`下载完成！共下载了 ${urlsToDownload.length} 张图片。`);
-
-        if (batchDownloadBtn) {
-            batchDownloadBtn.textContent = '批量下载媒体';
-            batchDownloadBtn.style.backgroundColor = '#1da1f2';
+        alert(`下载完成！共 ${urlsToDownload.length} 张。`);
+        resetButtons();
+    }
+    
+    async function stopCollectingAndCopy() {
+        isCollecting = false;
+        if (mediaPageObserver) mediaPageObserver.disconnect();
+        const urlsToCopy = Array.from(downloadQueue);
+        if (urlsToCopy.length === 0) { alert("无图片链接！"); resetButtons(); return; }
+        const originalUrls = urlsToCopy.map(getOriginalUrl);
+        const textToCopy = originalUrls.join('\n');
+        try {
+            await navigator.clipboard.writeText(textToCopy);
+            if(copyLinksBtn) {
+                copyLinksBtn.textContent = `已复制 ${urlsToCopy.length} 条!`;
+                copyLinksBtn.style.backgroundColor = '#28a745';
+            }
+            alert(`成功复制 ${urlsToCopy.length} 条链接！`);
+            setTimeout(resetButtons, 2000);
+        } catch (err) {
+            console.error('复制失败: ', err); alert('复制失败！'); resetButtons();
         }
-        downloadQueue.clear();
-        lastReportedCount = 0;
     }
 
-    function addBatchDownloaderButton() {
+    function addBatchActionButtons() {
         const userNameElement = document.querySelector('[data-testid="UserName"]');
         if (!userNameElement) return;
         const buttonContainer = userNameElement.parentElement;
-        if (!buttonContainer || document.getElementById('batch-media-downloader-btn')) return;
-
+        if (!buttonContainer || document.getElementById('batch-action-container')) return;
+        const container = document.createElement('div');
+        container.id = 'batch-action-container';
+        container.style.cssText = 'display: flex; gap: 8px; margin-left: 12px;';
         batchDownloadBtn = document.createElement('button');
-        batchDownloadBtn.id = 'batch-media-downloader-btn';
-        batchDownloadBtn.textContent = '批量下载媒体';
-        batchDownloadBtn.style.cssText = 'margin-left: 12px; padding: 6px 12px; background-color: #1da1f2; color: white; border: none; border-radius: 999px; cursor: pointer; font-weight: bold; transition: background-color 0.3s;';
-        batchDownloadBtn.addEventListener('click', (e) => {
-             e.preventDefault(); e.stopPropagation();
-            if (!isCollecting) { startCollecting(); } else { stopCollectingAndDownload(); }
-        });
-        buttonContainer.appendChild(batchDownloadBtn);
+        batchDownloadBtn.textContent = '批量下载';
+        batchDownloadBtn.style.cssText = 'padding: 6px 12px; background-color: #1da1f2; color: white; border: none; border-radius: 999px; cursor: pointer; font-weight: bold;';
+        batchDownloadBtn.onclick = () => { isCollecting ? stopCollectingAndDownload() : startCollecting(batchDownloadBtn); };
+        copyLinksBtn = document.createElement('button');
+        copyLinksBtn.textContent = '复制链接';
+        copyLinksBtn.style.cssText = 'padding: 6px 12px; background-color: #28a745; color: white; border: none; border-radius: 999px; cursor: pointer; font-weight: bold;';
+        copyLinksBtn.onclick = () => { isCollecting ? stopCollectingAndCopy() : startCollecting(copyLinksBtn); };
+        container.appendChild(batchDownloadBtn);
+        container.appendChild(copyLinksBtn);
+        buttonContainer.appendChild(container);
     }
 
     // --- 主函数：统一处理页面变化 ---
     function handlePageChanges() {
-        // 功能1: 单推文按钮
-        document.querySelectorAll('article[role="article"]:not(:has(.download-images-btn))').forEach(addSingleTweetButton);
-
-        // 功能2: 批量下载按钮
+        document.querySelectorAll('article[role="article"]').forEach(addSingleTweetButton);
         if (window.location.href.includes('/media')) {
-            addBatchDownloaderButton();
+            document.querySelectorAll('a[href*="/photo/"]').forEach(addHoverDownloader);
+            addBatchActionButtons();
         } else {
             if (isCollecting) {
                 isCollecting = false;
                 if(mediaPageObserver) mediaPageObserver.disconnect();
                 downloadQueue.clear();
-                lastReportedCount = 0;
-                console.log("已离开媒体页, 自动停止收集。");
+                activeButton = null;
             }
         }
     }
 
-    // 使用一个更高效的主观察者
     const mainObserver = new MutationObserver(throttle(handlePageChanges, 500));
     mainObserver.observe(document.body, { childList: true, subtree: true });
-
-    // 初始加载时执行一次
     handlePageChanges();
 
 })();
